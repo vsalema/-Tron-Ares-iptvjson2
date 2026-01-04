@@ -1,18 +1,6 @@
 {
   "type": "shared-history",
   "version": 1,
-  "generatedAt": "2026-01-04T19:40:00.852Z",
-  "items": [
-    {
-      "name": "The Big Ugly (2020)",
-      "url": "https://kalhlspd-a.akamaihd.net/dash/p/3418233/sp/341823300/serveFlavor/entryId/1_hw84jofb/v/1/ev/8/flavorId/1_,smcl53sb,tgm19r83,eclp6gdl,jaq3od3e,s5iaqbot,/forceproxy/true/name/a.mp4.urlset/manifest.mpd",
-      "tvgId": "1_hw84jofb",
-      "group": "Thriller",
-      "logo": {
-        "type": "image",
-        "value": "https://image.tmdb.org/t/p/original/mCYkwkB8NpiSHt8A3n9wg5awdbN.jpg"
-      },
-      "addedAt": "2026-01-04T19:36:19.522Z"
-    }
-  ]
+  "generatedAt": "2026-01-02T23:05:42Z",
+  "items": []
 }

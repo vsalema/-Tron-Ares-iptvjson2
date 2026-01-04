@@ -361,57 +361,87 @@ function hasUrlInList(listArr, url) {
 const SHARED_NEW_JSON_PATH = 'shared-last-added.json';
 const SHARED_NEW_MAX = 50;
 
+const FILM_KNOWN_KEYS_LS = 'tronAres_filmKnownKeys_v1';
+const FILM_PENDING_DELTA_LS = 'tronAres_filmPendingDelta_v1';
+
+// Clé stable: tvg-id si présent, sinon URL
+function filmKeyFromEntry(entry) {
+  const tvgId = entry?.tvgId ? String(entry.tvgId).trim() : '';
+  if (tvgId) return `id:${tvgId}`;
+  const url = entry?.url ? String(entry.url).trim() : '';
+  if (url) return `url:${url}`;
+  return '';
+}
+
+function loadJsonLS(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+function saveJsonLS(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
+let filmKnownKeySet = new Set(loadJsonLS(FILM_KNOWN_KEYS_LS, []));
+let filmBaselineReady = filmKnownKeySet.size > 0;
+
+// Pending delta persistant (si tu refresh avant d'export)
+let sessionDeltaItems = loadJsonLS(FILM_PENDING_DELTA_LS, []);
+let sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => String(it.key || filmKeyFromEntry(it))));
+sessionDeltaItems = sessionDeltaItems.filter(it => {
+  const k = String(it.key || filmKeyFromEntry(it));
+  return !!k;
+}).slice(-SHARED_NEW_MAX);
+
+function persistFilmKnownKeys() {
+  saveJsonLS(FILM_KNOWN_KEYS_LS, Array.from(filmKnownKeySet));
+}
+function persistPendingDelta() {
+  saveJsonLS(FILM_PENDING_DELTA_LS, sessionDeltaItems);
+}
+
 let sharedNewItems = [];              // ce que contient le fichier partagé (visible sur tous les PC)
-let sharedNewKeySet = new Set();      // clés déjà dans le fichier partagé (id:url)
-let sessionDeltaItems = [];           // nouveaux films ajoutés localement (à exporter)
-let sessionDeltaKeySet = new Set();   // dédupe session (id:url)
+let sharedNewKeySet = new Set();      // clés (tvg-id ou URL) déjà dans le fichier partagé
 
 let showingSharedNew = false;
 let currentSharedNewIndex = -1;
 
 function _stripForSharedNew(entry) {
   const url = entry?.url ? String(entry.url) : '';
-  const tvgId = entry?.tvgId ?? entry?.tvgID ?? entry?.tvgid ?? null;
   return {
     name: entry?.name ?? '',
     url,
-    tvgId,
     group: entry?.group ?? '',
     logo: entry?.logo ?? null,
     addedAt: new Date().toISOString()
   };
 }
 
-async function loadSharedNewFromRepo() {
+async async function loadSharedNewFromRepo() {
   try {
     const res = await fetch(SHARED_NEW_JSON_PATH + '?_=' + Date.now(), { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
 
     const items = Array.isArray(data?.items) ? data.items : [];
-    // normalisation + limite
     sharedNewItems = items
-      .filter(it => it && it.url)
+      .filter(it => it && (it.tvgId || it.url))
       .slice(-SHARED_NEW_MAX)
-      .map(it => {
-        const tvgId = it.tvgId ?? it['tvg-id'] ?? null;
-        return {
-          name: it.name ?? '',
-          url: String(it.url),
-          tvgId,
-          group: it.group ?? '',
-          logo: it.logo ?? null,
-          addedAt: it.addedAt ?? null,
-          listType: 'channels' // Film M3U
-        };
-      });
+      .map(it => ({
+        name: it.name ?? '',
+        url: it.url ? String(it.url) : '',
+        tvgId: it.tvgId ? String(it.tvgId) : '',
+        group: it.group ?? '',
+        logo: it.logo ?? null,
+        addedAt: it.addedAt ?? null,
+        listType: 'channels'
+      }));
 
-    // clés déjà publiées (on garde *id* et *url* pour compat)
-    sharedNewKeySet = new Set();
-    sharedNewItems.forEach(it => {
-      if (it.tvgId) sharedNewKeySet.add('id:' + String(it.tvgId));
-      if (it.url) sharedNewKeySet.add('url:' + String(it.url));
-    });
+    sharedNewKeySet = new Set(sharedNewItems.map(it => filmKeyFromEntry(it)).filter(Boolean));
   } catch (err) {
     console.warn('Impossible de charger ' + SHARED_NEW_JSON_PATH, err);
     sharedNewItems = [];
@@ -423,35 +453,38 @@ async function loadSharedNewFromRepo() {
 function registerDeltaIfNeeded(listType, entry) {
   if (listType !== 'channels') return; // Film M3U uniquement
 
-  const url = entry?.url ? String(entry.url) : '';
-  const tvgId = entry?.tvgId ?? entry?.tvgID ?? entry?.tvgid ?? null;
+  const key = filmKeyFromEntry(entry);
+  if (!key) return;
 
-  const keys = [];
-  if (tvgId) keys.push('id:' + String(tvgId));
-  if (url) keys.push('url:' + String(url));
+  // Déjà connu => pas un nouvel ajout
+  if (filmKnownKeySet.has(key)) return;
 
-  if (!keys.length) return;
+  // On marque comme connu immédiatement
+  filmKnownKeySet.add(key);
+  persistFilmKnownKeys();
 
-  // Si déjà dans le fichier partagé (déjà "publié"), on ignore
-  if (keys.some(k => sharedNewKeySet.has(k))) return;
+  // Si la base n'était pas prête (ajout manuel), on l'active
+  if (!filmBaselineReady) filmBaselineReady = true;
 
-  // Si déjà capturé dans cette session
-  if (keys.some(k => sessionDeltaKeySet.has(k))) return;
+  // Déjà dans le fichier partagé (déjà "publié") => pas besoin d'export delta
+  if (sharedNewKeySet.has(key)) return;
 
-  // Enregistre (on stocke toutes les clés pour éviter doublons)
-  keys.forEach(k => sessionDeltaKeySet.add(k));
-  sessionDeltaItems.push({ ..._stripForSharedNew(entry), listType: 'channels' });
+  // Dédup session/pending
+  if (sessionDeltaKeySet.has(key)) return;
 
-  // limite mémoire (au cas où gros import)
+  const cleaned = _stripForSharedNew(entry);
+  const deltaItem = { ...cleaned, key, listType: 'channels' };
+
+  sessionDeltaKeySet.add(key);
+  sessionDeltaItems.push(deltaItem);
+
+  // limite mémoire
   if (sessionDeltaItems.length > SHARED_NEW_MAX) {
-    const trimmed = sessionDeltaItems.slice(-SHARED_NEW_MAX);
-    sessionDeltaItems = trimmed;
-    sessionDeltaKeySet = new Set();
-    trimmed.forEach(it => {
-      if (it.tvgId) sessionDeltaKeySet.add('id:' + String(it.tvgId));
-      if (it.url) sessionDeltaKeySet.add('url:' + String(it.url));
-    });
+    sessionDeltaItems = sessionDeltaItems.slice(-SHARED_NEW_MAX);
+    sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => String(it.key)));
   }
+
+  persistPendingDelta();
   updateNewBtnLabel();
 }
 
@@ -460,7 +493,14 @@ function buildSharedDeltaJson() {
     type: 'shared-history',
     version: 1,
     generatedAt: new Date().toISOString(),
-    items: sessionDeltaItems.slice(-SHARED_NEW_MAX).map(it => ({ name: it.name, url: it.url, tvgId: it.tvgId ?? null, group: it.group, logo: it.logo, addedAt: it.addedAt }))
+    items: sessionDeltaItems.slice(-SHARED_NEW_MAX).map(it => ({
+      name: it.name,
+      url: it.url,
+      tvgId: it.tvgId || '',
+      group: it.group,
+      logo: it.logo,
+      addedAt: it.addedAt
+    }))
   };
 }
 
@@ -475,46 +515,19 @@ function downloadJson(filename, obj) {
   setTimeout(() => URL.revokeObjectURL(a.href), 500);
 }
 
-async function exportSharedNewDelta() {
-  // Recharge l'historique partagé pour dédupe solide (au cas où tu as déjà commit une nouvelle version)
-  await loadSharedNewFromRepo();
-
-  // Filtre de sécurité: ne garder que ce qui n'est toujours pas publié
-  const safeItems = sessionDeltaItems.filter(it => {
-    const keys = [];
-    if (it.tvgId) keys.push('id:' + String(it.tvgId));
-    if (it.url) keys.push('url:' + String(it.url));
-    return keys.length && !keys.some(k => sharedNewKeySet.has(k));
-  });
-
-  if (!safeItems.length) {
+function exportSharedNewDelta() {
+  if (!sessionDeltaItems.length) {
     toast ? toast('Aucun nouveau film à exporter') : alert('Aucun nouveau film à exporter');
     return;
   }
+  downloadJson('shared-last-added.json', buildSharedDeltaJson());
 
-  // Export uniquement les nouveaux
-  const payload = {
-    type: 'shared-history',
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    items: safeItems.slice(-SHARED_NEW_MAX).map(it => ({
-      name: it.name,
-      url: it.url,
-      tvgId: it.tvgId ?? null,
-      group: it.group ?? '',
-      logo: it.logo ?? null,
-      addedAt: it.addedAt ?? null
-    }))
-  };
-
-  downloadJson('shared-last-added.json', payload);
-
-  // ✅ Après export, vider la "session delta" pour que le prochain export
-  // contienne uniquement les ajouts faits APRÈS cet export.
+  // Une fois exporté, on considère que le "delta" est consommé
   sessionDeltaItems = [];
   sessionDeltaKeySet = new Set();
-
+  persistPendingDelta();
   updateNewBtnLabel();
+
   toast ? toast('JSON exporté : shared-last-added.json (à commit)') : null;
 }
 
@@ -590,25 +603,48 @@ function ingestEntries(listType, entries, targetArr) {
   let added = 0;
   let newlyUnread = 0;
 
-  for (const e of entries) {
-    const url = e?.url ? String(e.url) : '';
+  // Première import (bulk) = on initialise la base (pour éviter que tout soit considéré "nouveau")
+  const isBulkSeed = (listType === 'channels' && !filmBaselineReady && entries.length >= 5);
 
-    // dédupe robuste Film M3U: priorité au tvg-id (stable), sinon fallback URL
-    if (listType === 'channels') {
-      const tvgId = e?.tvgId ?? e?.tvgID ?? e?.tvgid ?? null;
-      if (tvgId && targetArr.some(it => (it?.tvgId ?? it?.tvgID ?? it?.tvgid ?? null) === tvgId)) continue;
+  for (const e of entries) {
+    const key = (listType === 'channels') ? filmKeyFromEntry(e) : (e?.url ? String(e.url) : '');
+
+    // Déduplication
+    if (key) {
+      const exists = targetArr.some(it => {
+        const k2 = (listType === 'channels') ? filmKeyFromEntry(it) : (it?.url ? String(it.url) : '');
+        return k2 && String(k2) === String(key);
+      });
+      if (exists) continue;
     }
-    if (url && hasUrlInList(targetArr, url)) continue; // dédupe URL
+
     targetArr.push(e);
+
     // attach listType for badges/seen tracking
     try { if (e && !e.listType) e.listType = listType; } catch {}
-    try { registerDeltaIfNeeded(listType, e); } catch {}
+
+    if (isBulkSeed && listType === 'channels') {
+      // Seed baseline sans marquer "nouveau"
+      const fk = filmKeyFromEntry(e);
+      if (fk) filmKnownKeySet.add(fk);
+    } else {
+      try { registerDeltaIfNeeded(listType, e); } catch {}
+    }
+
     added += 1;
 
+    // Unread tracking (conserve la logique existante par URL si dispo)
+    const url = e?.url ? String(e.url) : '';
     if (url && !isSeen(listType, url)) {
       if (!isUnread(listType, url)) newlyUnread += 1;
       markUnread(listType, url);
     }
+  }
+
+  if (isBulkSeed && listType === 'channels' && added > 0) {
+    filmBaselineReady = true;
+    persistFilmKnownKeys();
+    toast ? toast('Base initialisée : les prochains ajouts seront détectés.') : null;
   }
 
   if (added > 0) {
@@ -616,6 +652,7 @@ function ingestEntries(listType, entries, targetArr) {
     updateTabBadges();
     if (newlyUnread > 0) toast(`+${newlyUnread} ajout(s) nouveau(x)`);
   }
+
   return { added, newlyUnread };
 }
 
@@ -2895,7 +2932,8 @@ function scrollToActiveItem() {
 // M3U PARSER
 // =====================================================
 function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
-  const lines = content.split(/\r?\n/);
+  const lines = content.split(/?
+/);
   const results = [];
   let lastInf = null;
 
@@ -2914,24 +2952,27 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
     let name = 'Sans titre';
     let logo = null;
     let group = defaultGroup;
-    let tvgId = null;
-    let tvgName = null;
+    let tvgId = '';
 
     if (lastInf) {
+      // Nom (après la virgule)
       const nameMatch = lastInf.split(',').slice(-1)[0].trim();
       if (nameMatch) name = nameMatch;
 
-      const tvgIdMatch = lastInf.match(/tvg-id="([^"]+)"/i);
-      if (tvgIdMatch) tvgId = tvgIdMatch[1];
-
       const tvgNameMatch = lastInf.match(/tvg-name="([^"]+)"/i);
-      if (tvgNameMatch) tvgName = tvgNameMatch[1];
+      if (tvgNameMatch && tvgNameMatch[1]) {
+        const n = tvgNameMatch[1].trim();
+        if (n) name = n;
+      }
+
+      const tvgIdMatch = lastInf.match(/tvg-id="([^"]+)"/i);
+      if (tvgIdMatch && tvgIdMatch[1]) tvgId = tvgIdMatch[1].trim();
 
       const logoMatch = lastInf.match(/tvg-logo="([^"]+)"/i);
-      if (logoMatch) logo = { type: 'image', value: logoMatch[1] };
+      if (logoMatch && logoMatch[1]) logo = { type: 'image', value: logoMatch[1] };
 
       const groupMatch = lastInf.match(/group-title="([^"]+)"/i);
-      if (groupMatch) group = groupMatch[1];
+      if (groupMatch && groupMatch[1]) group = groupMatch[1];
     }
 
     results.push({
@@ -2939,7 +2980,6 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
       name,
       url,
       tvgId,
-      tvgName,
       logo: normalizeLogo(logo, name),
       group,
       isIframe: isYoutubeUrl(url),
