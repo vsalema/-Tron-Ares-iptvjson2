@@ -361,145 +361,148 @@ function hasUrlInList(listArr, url) {
 const SHARED_NEW_JSON_PATH = 'shared-last-added.json';
 const SHARED_NEW_MAX = 50;
 
-const FILM_KNOWN_KEYS_LS = 'tronAres_filmKnownKeys_v1';
-const FILM_PENDING_DELTA_LS = 'tronAres_filmPendingDelta_v1';
-
-// Clé stable: tvg-id si présent, sinon URL
-function filmKeyFromEntry(entry) {
-  const tvgId = entry?.tvgId ? String(entry.tvgId).trim() : '';
-  if (tvgId) return `id:${tvgId}`;
-  const url = entry?.url ? String(entry.url).trim() : '';
+// --- Clés stables Film ---
+// On identifie un film par tvg-id quand il existe (stable), sinon fallback URL.
+function filmKey(entryOrItem) {
+  if (!entryOrItem) return '';
+  const tvgId = entryOrItem.tvgId ?? entryOrItem['tvg-id'] ?? entryOrItem.tvgid ?? entryOrItem.idTvg;
+  if (tvgId && String(tvgId).trim()) return `id:${String(tvgId).trim()}`;
+  const url = entryOrItem.url ? String(entryOrItem.url).trim() : '';
   if (url) return `url:${url}`;
   return '';
 }
 
-function loadJsonLS(key, fallback) {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
+function hasFilmKeyInList(listArr, key) {
+  if (!key) return false;
+  if (!Array.isArray(listArr) || !listArr.length) return false;
+  if (key.startsWith('id:')) {
+    const tid = key.slice(3);
+    return listArr.some(it => it && it.tvgId && String(it.tvgId).trim() === tid);
   }
-}
-function saveJsonLS(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
-}
-
-let filmKnownKeySet = new Set(loadJsonLS(FILM_KNOWN_KEYS_LS, []));
-let filmBaselineReady = filmKnownKeySet.size > 0;
-
-// Pending delta persistant (si tu refresh avant d'export)
-let sessionDeltaItems = loadJsonLS(FILM_PENDING_DELTA_LS, []);
-let sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => String(it.key || filmKeyFromEntry(it))));
-sessionDeltaItems = sessionDeltaItems.filter(it => {
-  const k = String(it.key || filmKeyFromEntry(it));
-  return !!k;
-}).slice(-SHARED_NEW_MAX);
-
-function persistFilmKnownKeys() {
-  saveJsonLS(FILM_KNOWN_KEYS_LS, Array.from(filmKnownKeySet));
-}
-function persistPendingDelta() {
-  saveJsonLS(FILM_PENDING_DELTA_LS, sessionDeltaItems);
+  if (key.startsWith('url:')) {
+    const u = key.slice(4);
+    return listArr.some(it => it && it.url && String(it.url).trim() === u);
+  }
+  return false;
 }
 
+// --- Persistance locale (pour détecter les vrais nouveaux ajouts) ---
+const FILM_KNOWN_LS_KEY = 'tronAres_filmKnownKeys_v1';
+const FILM_PENDING_LS_KEY = 'tronAres_filmPendingDelta_v1';
+
+let filmKnownKeySet = new Set();
+let filmBaselineReady = false;
+let baselineInitializing = false;
+
+function loadFilmKnownSet() {
+  try {
+    const raw = localStorage.getItem(FILM_KNOWN_LS_KEY);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    if (Array.isArray(arr)) {
+      filmKnownKeySet = new Set(arr.filter(Boolean).map(v => String(v)));
+      filmBaselineReady = filmKnownKeySet.size > 0;
+    }
+  } catch {}
+}
+
+function saveFilmKnownSet() {
+  try {
+    // Cap raisonnable pour éviter un localStorage trop lourd
+    const arr = Array.from(filmKnownKeySet);
+    const capped = arr.length > 20000 ? arr.slice(-20000) : arr;
+    localStorage.setItem(FILM_KNOWN_LS_KEY, JSON.stringify(capped));
+  } catch {}
+}
+
+// --- Contenu partagé + delta session ---
 let sharedNewItems = [];              // ce que contient le fichier partagé (visible sur tous les PC)
-let sharedNewKeySet = new Set();      // clés (tvg-id ou URL) déjà dans le fichier partagé
+let sharedNewKeySet = new Set();      // clés (tvg-id/url) déjà dans le fichier partagé
+let sessionDeltaItems = [];           // nouveaux films détectés localement (à exporter)
+let sessionDeltaKeySet = new Set();   // dédupe session
 
 let showingSharedNew = false;
 let currentSharedNewIndex = -1;
 
+// Restaure les deltas non exportés (si tu recharges la page avant d'exporter)
+function loadPendingDelta() {
+  try {
+    const raw = localStorage.getItem(FILM_PENDING_LS_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    const items = Array.isArray(obj?.items) ? obj.items : [];
+    sessionDeltaItems = items.slice(-SHARED_NEW_MAX);
+    sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => filmKey(it)).filter(Boolean));
+  } catch {}
+}
+
+function persistPendingDelta() {
+  try {
+    localStorage.setItem(FILM_PENDING_LS_KEY, JSON.stringify({
+      v: 1,
+      savedAt: new Date().toISOString(),
+      items: sessionDeltaItems.slice(-SHARED_NEW_MAX)
+    }));
+  } catch {}
+}
+
+function clearPendingDelta() {
+  sessionDeltaItems = [];
+  sessionDeltaKeySet = new Set();
+  try { localStorage.removeItem(FILM_PENDING_LS_KEY); } catch {}
+}
+
 function _stripForSharedNew(entry) {
-  const url = entry?.url ? String(entry.url) : '';
+  const k = filmKey(entry);
   return {
+    tvgId: entry?.tvgId ?? null,
     name: entry?.name ?? '',
-    url,
+    url: entry?.url ? String(entry.url) : '',
     group: entry?.group ?? '',
     logo: entry?.logo ?? null,
-    addedAt: new Date().toISOString()
+    addedAt: new Date().toISOString(),
+    _key: k
   };
 }
 
-async async function loadSharedNewFromRepo() {
+async function loadSharedNewFromRepo() {
   try {
-    const res = await fetch(SHARED_NEW_JSON_PATH + '?_=' + Date.now(), { cache: 'no-store' });
+    const res = await fetch(SHARED_NEW_JSON_PATH + '?_=' + Date.now());
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-
     const items = Array.isArray(data?.items) ? data.items : [];
-    sharedNewItems = items
-      .filter(it => it && (it.tvgId || it.url))
-      .slice(-SHARED_NEW_MAX)
-      .map(it => ({
-        name: it.name ?? '',
-        url: it.url ? String(it.url) : '',
-        tvgId: it.tvgId ? String(it.tvgId) : '',
-        group: it.group ?? '',
-        logo: it.logo ?? null,
-        addedAt: it.addedAt ?? null,
-        listType: 'channels'
-      }));
-
-    sharedNewKeySet = new Set(sharedNewItems.map(it => filmKeyFromEntry(it)).filter(Boolean));
-  } catch (err) {
-    console.warn('Impossible de charger ' + SHARED_NEW_JSON_PATH, err);
+    sharedNewItems = items.map(it => ({
+      tvgId: it?.tvgId ?? null,
+      name: it?.name ?? '',
+      url: it?.url ? String(it.url) : '',
+      group: it?.group ?? '',
+      logo: it?.logo ?? null,
+      addedAt: it?.addedAt ?? null,
+      _key: filmKey(it)
+    })).filter(it => it.url || it.tvgId);
+    sharedNewKeySet = new Set(sharedNewItems.map(it => it._key).filter(Boolean));
+  } catch {
+    // si le fichier n'existe pas encore, on garde vide
     sharedNewItems = [];
     sharedNewKeySet = new Set();
   }
   updateNewBtnLabel();
+  if (showingSharedNew) renderSharedNewList();
 }
 
-function registerDeltaIfNeeded(listType, entry) {
-  if (listType !== 'channels') return; // Film M3U uniquement
-
-  const key = filmKeyFromEntry(entry);
-  if (!key) return;
-
-  // Déjà connu => pas un nouvel ajout
-  if (filmKnownKeySet.has(key)) return;
-
-  // On marque comme connu immédiatement
-  filmKnownKeySet.add(key);
-  persistFilmKnownKeys();
-
-  // Si la base n'était pas prête (ajout manuel), on l'active
-  if (!filmBaselineReady) filmBaselineReady = true;
-
-  // Déjà dans le fichier partagé (déjà "publié") => pas besoin d'export delta
-  if (sharedNewKeySet.has(key)) return;
-
-  // Dédup session/pending
-  if (sessionDeltaKeySet.has(key)) return;
-
-  const cleaned = _stripForSharedNew(entry);
-  const deltaItem = { ...cleaned, key, listType: 'channels' };
-
-  sessionDeltaKeySet.add(key);
-  sessionDeltaItems.push(deltaItem);
-
-  // limite mémoire
-  if (sessionDeltaItems.length > SHARED_NEW_MAX) {
-    sessionDeltaItems = sessionDeltaItems.slice(-SHARED_NEW_MAX);
-    sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => String(it.key)));
-  }
-
-  persistPendingDelta();
-  updateNewBtnLabel();
-}
-
+// JSON delta = uniquement les nouveaux films de la session
 function buildSharedDeltaJson() {
   return {
     type: 'shared-history',
     version: 1,
     generatedAt: new Date().toISOString(),
     items: sessionDeltaItems.slice(-SHARED_NEW_MAX).map(it => ({
-      name: it.name,
-      url: it.url,
-      tvgId: it.tvgId || '',
-      group: it.group,
-      logo: it.logo,
-      addedAt: it.addedAt
+      tvgId: it?.tvgId ?? null,
+      name: it?.name ?? '',
+      url: it?.url ?? '',
+      group: it?.group ?? '',
+      logo: it?.logo ?? null,
+      addedAt: it?.addedAt ?? new Date().toISOString()
     }))
   };
 }
@@ -522,9 +525,8 @@ function exportSharedNewDelta() {
   }
   downloadJson('shared-last-added.json', buildSharedDeltaJson());
 
-  // Une fois exporté, on considère que le "delta" est consommé
-  sessionDeltaItems = [];
-  sessionDeltaKeySet = new Set();
+  // IMPORTANT : après export, on vide la file des "nouveaux"
+  clearPendingDelta();
   persistPendingDelta();
   updateNewBtnLabel();
 
@@ -550,13 +552,50 @@ function updateNewBtnLabel() {
   btn.classList.toggle('is-active', showingSharedNew);
 }
 
-function updateFilmToolsVisibility(){
-  const row = document.getElementById('filmToolsRow');
-  if (!row) return;
-  const activeTab = document.querySelector('.tab-btn.active')?.dataset?.tab || currentListType || '';
-  row.style.display = (activeTab === 'channels') ? 'flex' : 'none';
+// Détecte un "nouveau film" UNIQUEMENT si son tvg-id (ou URL fallback) n'a jamais été vu sur CET appareil.
+function registerDeltaIfNeeded(listType, entry) {
+  if (listType !== 'channels') return; // Film M3U uniquement
+
+  const key = filmKey(entry);
+  if (!key) return;
+
+  // Phase "baseline" : 1er gros chargement -> on enregistre sans marquer "nouveau"
+  if (baselineInitializing) {
+    filmKnownKeySet.add(key);
+    return;
+  }
+
+  // Si déjà connu localement, ce n'est pas un nouvel ajout
+  if (filmKnownKeySet.has(key)) return;
+
+  // Marquer comme connu
+  filmKnownKeySet.add(key);
+
+  // Si déjà présent dans le fichier partagé, inutile d'exporter
+  if (sharedNewKeySet.has(key)) return;
+
+  // Dédup session
+  if (sessionDeltaKeySet.has(key)) return;
+
+  const stripped = { ..._stripForSharedNew(entry), listType: 'channels' };
+  sessionDeltaKeySet.add(key);
+  sessionDeltaItems.push(stripped);
+
+  // limite
+  if (sessionDeltaItems.length > SHARED_NEW_MAX) {
+    const trimmed = sessionDeltaItems.slice(-SHARED_NEW_MAX);
+    sessionDeltaItems = trimmed;
+    sessionDeltaKeySet = new Set(trimmed.map(it => filmKey(it)).filter(Boolean));
+  }
+
+  persistPendingDelta();
+  saveFilmKnownSet();
+  updateNewBtnLabel();
 }
 
+// init local stores
+loadFilmKnownSet();
+loadPendingDelta();
 function renderSharedNewList() {
   if (!channelListEl) return;
   channelListEl.innerHTML = '';
@@ -603,48 +642,58 @@ function ingestEntries(listType, entries, targetArr) {
   let added = 0;
   let newlyUnread = 0;
 
-  // Première import (bulk) = on initialise la base (pour éviter que tout soit considéré "nouveau")
-  const isBulkSeed = (listType === 'channels' && !filmBaselineReady && entries.length >= 5);
+  // Baseline Film M3U : si c'est le 1er gros chargement (liste vide + pas d'historique local)
+  // on enregistre les clés connues sans considérer que ce sont des "nouveaux ajouts".
+  const beforeLen = Array.isArray(targetArr) ? targetArr.length : 0;
+  const shouldBaseline =
+    (listType === 'channels') &&
+    (!filmBaselineReady) &&
+    (filmKnownKeySet.size === 0) &&
+    (beforeLen === 0) &&
+    (entries.length > 5);
+
+  if (shouldBaseline) baselineInitializing = true;
 
   for (const e of entries) {
-    const key = (listType === 'channels') ? filmKeyFromEntry(e) : (e?.url ? String(e.url) : '');
+    const url = e?.url ? String(e.url) : '';
+    if (!url) continue;
 
-    // Déduplication
-    if (key) {
-      const exists = targetArr.some(it => {
-        const k2 = (listType === 'channels') ? filmKeyFromEntry(it) : (it?.url ? String(it.url) : '');
-        return k2 && String(k2) === String(key);
-      });
-      if (exists) continue;
+    // Dédup robuste pour Film : tvg-id d'abord, sinon URL
+    if (listType === 'channels') {
+      const k = filmKey(e);
+      if (k && hasFilmKeyInList(targetArr, k)) continue;
+    } else {
+      if (hasUrlInList(targetArr, url)) continue;
     }
 
     targetArr.push(e);
 
     // attach listType for badges/seen tracking
     try { if (e && !e.listType) e.listType = listType; } catch {}
-
-    if (isBulkSeed && listType === 'channels') {
-      // Seed baseline sans marquer "nouveau"
-      const fk = filmKeyFromEntry(e);
-      if (fk) filmKnownKeySet.add(fk);
-    } else {
-      try { registerDeltaIfNeeded(listType, e); } catch {}
-    }
+    try { registerDeltaIfNeeded(listType, e); } catch {}
 
     added += 1;
 
-    // Unread tracking (conserve la logique existante par URL si dispo)
-    const url = e?.url ? String(e.url) : '';
+    // Unread tracking (garde ton comportement existant)
     if (url && !isSeen(listType, url)) {
       if (!isUnread(listType, url)) newlyUnread += 1;
       markUnread(listType, url);
     }
   }
 
-  if (isBulkSeed && listType === 'channels' && added > 0) {
+  // Fin baseline
+  if (shouldBaseline) {
+    baselineInitializing = false;
     filmBaselineReady = true;
-    persistFilmKnownKeys();
-    toast ? toast('Base initialisée : les prochains ajouts seront détectés.') : null;
+    saveFilmKnownSet();
+    // Par sécurité, si un ancien état avait laissé un delta, on nettoie.
+    clearPendingDelta();
+    persistPendingDelta();
+    updateNewBtnLabel();
+    toast ? toast('Base Film initialisée (les prochains ajouts seront détectés)') : null;
+  } else if (listType === 'channels') {
+    // Film : on persiste l'état connu au fil de l'eau
+    saveFilmKnownSet();
   }
 
   if (added > 0) {
@@ -652,7 +701,6 @@ function ingestEntries(listType, entries, targetArr) {
     updateTabBadges();
     if (newlyUnread > 0) toast(`+${newlyUnread} ajout(s) nouveau(x)`);
   }
-
   return { added, newlyUnread };
 }
 
@@ -2932,8 +2980,7 @@ function scrollToActiveItem() {
 // M3U PARSER
 // =====================================================
 function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
-  const lines = content.split(/?
-/);
+  const lines = content.split(/\r?\n/);
   const results = [];
   let lastInf = null;
 
@@ -2952,27 +2999,24 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
     let name = 'Sans titre';
     let logo = null;
     let group = defaultGroup;
-    let tvgId = '';
+    let tvgId = null;
+    let tvgName = null;
 
     if (lastInf) {
-      // Nom (après la virgule)
       const nameMatch = lastInf.split(',').slice(-1)[0].trim();
       if (nameMatch) name = nameMatch;
 
-      const tvgNameMatch = lastInf.match(/tvg-name="([^"]+)"/i);
-      if (tvgNameMatch && tvgNameMatch[1]) {
-        const n = tvgNameMatch[1].trim();
-        if (n) name = n;
-      }
-
-      const tvgIdMatch = lastInf.match(/tvg-id="([^"]+)"/i);
-      if (tvgIdMatch && tvgIdMatch[1]) tvgId = tvgIdMatch[1].trim();
-
       const logoMatch = lastInf.match(/tvg-logo="([^"]+)"/i);
-      if (logoMatch && logoMatch[1]) logo = { type: 'image', value: logoMatch[1] };
+      if (logoMatch) logo = { type: 'image', value: logoMatch[1] };
 
       const groupMatch = lastInf.match(/group-title="([^"]+)"/i);
-      if (groupMatch && groupMatch[1]) group = groupMatch[1];
+      if (groupMatch) group = groupMatch[1];
+
+      const idMatch = lastInf.match(/tvg-id="([^"]+)"/i);
+      if (idMatch) tvgId = String(idMatch[1]).trim();
+
+      const tvgNameMatch = lastInf.match(/tvg-name="([^"]+)"/i);
+      if (tvgNameMatch) tvgName = String(tvgNameMatch[1]).trim();
     }
 
     results.push({
@@ -2980,6 +3024,7 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
       name,
       url,
       tvgId,
+      tvgName,
       logo: normalizeLogo(logo, name),
       group,
       isIframe: isYoutubeUrl(url),
