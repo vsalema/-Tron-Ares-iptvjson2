@@ -6,11 +6,13 @@
   <title>Tron Ares IPTV Player</title>
 
   <!-- Police futuriste -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800&display=swap" rel="stylesheet">
 
   <!-- HLS & DASH -->
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dashjs@latest/dist/dash.all.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dashjs@latest/dist/dash.all.min.js"></script>
 
   <link rel="stylesheet" href="tron-ares.balanced.fixcls.css">
 </head>
@@ -69,11 +71,12 @@
 
   <button id="radioPlayBtn" class="mini-radio-btn" data-luna-url="https://vsalema.github.io/luna/">▶</button>
 </div>
-  
-  <div id="filmToolsRow" class="new-additions-row new-additions-row--center">
-    <button id="toggleNewBtn" class="btn btn-ghost" title="Afficher uniquement les derniers ajouts (NEW) sur Film M3U">🆕 Derniers ajouts</button>
-  </div>
+<!-- Bouton Derniers ajouts (Films uniquement) -->
+<div id="newAdditionsContainer" class="hidden">
+  <button id="newAdditionsBtn" class="btn btn-accent" type="button">🆕 Derniers ajouts</button>
+</div>
 
+  
     <div class="lists-container">
   <div class="scroll-fade"></div>
 
@@ -136,16 +139,6 @@
         <button class="btn btn-ghost" id="exportM3uJsonBtn">Export M3U → JSON</button>
         <button class="btn btn-ghost" id="exportIframeJsonBtn">Export iFrame → JSON</button>
       </div>
-      <div class="loader-label" style="margin-top:8px;">🆕 Derniers ajouts (Film M3U) — fichier partagé</div>
-      <div class="loader-subrow" style="margin-top:-2px;">
-        <span>Export = uniquement les nouveaux films ajoutés (delta). Commit <b>shared-last-added.json</b> dans ton repo pour le voir sur un autre PC.</span>
-      </div>
-      <div class="loader-row loader-row--wrap shared-history-actions">
-        <button class="btn btn-ghost" id="reloadSharedNewBtn" title="Recharge shared-last-added.json depuis GitHub Pages">↻ Recharger</button>
-        <button class="btn btn-accent" id="exportSharedDeltaBtn" title="Télécharge shared-last-added.json avec uniquement les nouveaux films ajoutés">Exporter nouveaux → JSON</button>
-        <button class="btn btn-ghost" id="exportSharedEmptyBtn" title="Télécharge un shared-last-added.json vide (à commit pour effacer la liste)">Vider (JSON)</button>
-      </div>
-
       <div class="loader-row">
         <button class="btn btn-accent" id="importJsonBtn">Importer JSON</button>
       </div>

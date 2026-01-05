@@ -188,12 +188,47 @@ const iframeItems = [];   // Overlays / iFrames
 // ✅ UID GLOBAL UNIQUE (PERSISTANT) + HELPERS ID/LOGO
 // =====================================================
 let uid = Number(localStorage.getItem('tronAresUid') || '0');
+
+// ⚡️Perf: évite d’écrire dans localStorage à chaque item importé (sync + bloquant)
+let uidDirty = false;
+let uidFlushScheduled = false;
+
+function flushUid() {
+  if (!uidDirty) return;
+  try { localStorage.setItem('tronAresUid', String(uid)); } catch (_) {}
+  uidDirty = false;
+}
+
+function scheduleUidFlush() {
+  if (uidFlushScheduled) return;
+  uidFlushScheduled = true;
+
+  const run = () => {
+    uidFlushScheduled = false;
+    flushUid();
+  };
+
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(run, { timeout: 1000 });
+  } else {
+    setTimeout(run, 250);
+  }
+}
+
 function nextUid() {
   uid += 1;
-  localStorage.setItem('tronAresUid', String(uid));
+  uidDirty = true;
+
+  // Flush périodique (batch)
+  if ((uid % 50) === 0) scheduleUidFlush();
   return uid;
 }
 
+// Sécurise la persistance si l’onglet se ferme / passe en arrière-plan
+window.addEventListener('pagehide', flushUid);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushUid();
+});
 function normalizeLogo(logo, fallbackName) {
   if (logo && typeof logo === 'object') {
     if (logo.type === 'image' && typeof logo.value === 'string' && logo.value.trim()) return logo;
@@ -202,775 +237,97 @@ function normalizeLogo(logo, fallbackName) {
   return deriveLogoFromName(fallbackName);
 }
 
-/* =====================================================
-   NOUVEAUX AJOUTS (persistants) + SYNC multi-appareils
-   ===================================================== */
-
-const NEWSTATE_KEY = 'tronAresNewState_v1';
-const SUPABASE_CFG_KEY = 'tronAresSupabaseCfg_v1';
-const SYNC_CODE_KEY = 'tronAresSyncCode_v1';
-
-/**
- * newState:
- * {
- *   version: 1,
- *   seen:   { channels:{url:ts}, fr:{url:ts}, iframe:{url:ts} },
- *   unread: { channels:{url:addedTs}, fr:{url:addedTs}, iframe:{url:addedTs} },
- *   updatedAt: ts
- * }
- */
-function defaultNewState() {
-  return {
-    version: 1,
-    seen:   { channels: {}, fr: {}, iframe: {} },
-    unread: { channels: {}, fr: {}, iframe: {} },
-    updatedAt: Date.now()
-  };
-}
-
-function loadNewState() {
-  try {
-    const raw = localStorage.getItem(NEWSTATE_KEY);
-    if (!raw) return defaultNewState();
-    const obj = JSON.parse(raw);
-    if (!obj || typeof obj !== 'object') return defaultNewState();
-    // Migrations simples
-    if (!obj.seen) obj.seen = { channels: {}, fr: {}, iframe: {} };
-    if (!obj.unread) obj.unread = { channels: {}, fr: {}, iframe: {} };
-    if (!obj.updatedAt) obj.updatedAt = Date.now();
-    return obj;
-  } catch {
-    return defaultNewState();
-  }
-}
-
-let newState = loadNewState();
-
-let _saveNewStateTimer = null;
-function saveNewStateSoon() {
-  if (_saveNewStateTimer) clearTimeout(_saveNewStateTimer);
-  _saveNewStateTimer = setTimeout(() => {
-    try {
-      newState.updatedAt = Date.now();
-      localStorage.setItem(NEWSTATE_KEY, JSON.stringify(newState));
-    } catch {}
-    updateTabBadges();
-    scheduleSyncPush();
-  }, 250);
-}
-
-function keyForListType(listType) {
-  if (listType === 'channels') return 'channels';
-  if (listType === 'fr') return 'fr';
-  if (listType === 'iframe') return 'iframe';
-  return 'channels';
-}
-
-function isSeen(listType, url) {
-  if (!url) return false;
-  const lt = keyForListType(listType);
-  return !!newState.seen?.[lt]?.[url];
-}
-
-function isUnread(listType, url) {
-  if (!url) return false;
-  const lt = keyForListType(listType);
-  return !!newState.unread?.[lt]?.[url] && !isSeen(lt, url);
-}
-
-function markSeen(listType, url) {
-  if (!url) return;
-  const lt = keyForListType(listType);
-  if (!newState.seen[lt]) newState.seen[lt] = {};
-  newState.seen[lt][url] = Date.now();
-  if (newState.unread?.[lt]?.[url]) delete newState.unread[lt][url];
-  saveNewStateSoon();
-}
-
-function markUnread(listType, url) {
-  if (!url) return;
-  const lt = keyForListType(listType);
-  if (isSeen(lt, url)) return;
-  if (!newState.unread[lt]) newState.unread[lt] = {};
-  if (!newState.unread[lt][url]) newState.unread[lt][url] = Date.now();
-  saveNewStateSoon();
-}
-
-function cleanupUnreadAgainstSeen() {
-  for (const lt of ['channels', 'fr', 'iframe']) {
-    const unread = newState.unread[lt] || {};
-    for (const url of Object.keys(unread)) {
-      if (newState.seen?.[lt]?.[url]) delete unread[url];
-    }
-    newState.unread[lt] = unread;
-  }
-}
-
-function countUnread(lt) {
-  const unread = newState.unread?.[lt] || {};
-  return Object.keys(unread).length;
-}
-
-let toastTimer = null;
-function toast(msg) {
-  if (!toastEl) return;
-  toastEl.textContent = msg;
-  toastEl.classList.remove('hidden');
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    toastEl.classList.add('hidden');
-  }, 2200);
-}
-
-function updateTabBadges() {
-  if (!tabNewCountEls || !tabNewCountEls.length) return;
-  cleanupUnreadAgainstSeen();
-
-  const map = {
-    fr: countUnread('fr'),
-    channels: countUnread('channels'),
-    iframes: countUnread('iframe'),
-    favorites: 0
-  };
-
-  tabNewCountEls.forEach(el => {
-    const tab = el.getAttribute('data-tab');
-    const n = map[tab] || 0;
-    if (n > 0) {
-      el.textContent = String(n);
-      el.setAttribute('data-show', '1');
-    } else {
-      el.textContent = '';
-      el.removeAttribute('data-show');
-    }
-  });
-}
-
-/** Déduplication par URL (évite d’empiler les mêmes playlists). */
-function hasUrlInList(listArr, url) {
-  if (!url) return false;
-  return listArr.some(it => (it && it.url) ? String(it.url) === String(url) : false);
-}
-
-
-/* =====================================================
-   🆕 HISTORIQUE PARTAGÉ (GitHub Pages) — FILM M3U ONLY
-   - Fichier: shared-last-added.json (à commit dans le repo)
-   - Mode "delta": l'export contient uniquement les nouvelles entrées ajoutées depuis la dernière version du fichier
-   ===================================================== */
-const SHARED_NEW_JSON_PATH = 'shared-last-added.json';
-const SHARED_NEW_MAX = 50;
-
-// --- Clés stables Film ---
-// On identifie un film par tvg-id quand il existe (stable), sinon fallback URL.
-function filmKey(entryOrItem) {
-  if (!entryOrItem) return '';
-  const tvgId = entryOrItem.tvgId ?? entryOrItem['tvg-id'] ?? entryOrItem.tvgid ?? entryOrItem.idTvg;
-  if (tvgId && String(tvgId).trim()) return `id:${String(tvgId).trim()}`;
-  const url = entryOrItem.url ? String(entryOrItem.url).trim() : '';
-  if (url) return `url:${url}`;
-  return '';
-}
-
-function hasFilmKeyInList(listArr, key) {
-  if (!key) return false;
-  if (!Array.isArray(listArr) || !listArr.length) return false;
-  if (key.startsWith('id:')) {
-    const tid = key.slice(3);
-    return listArr.some(it => it && it.tvgId && String(it.tvgId).trim() === tid);
-  }
-  if (key.startsWith('url:')) {
-    const u = key.slice(4);
-    return listArr.some(it => it && it.url && String(it.url).trim() === u);
-  }
-  return false;
-}
-
-// --- Persistance locale (pour détecter les vrais nouveaux ajouts) ---
-const FILM_KNOWN_LS_KEY = 'tronAres_filmKnownKeys_v1';
-const FILM_PENDING_LS_KEY = 'tronAres_filmPendingDelta_v1';
-
-let filmKnownKeySet = new Set();
-let filmBaselineReady = false;
-let baselineInitializing = false;
-
-function loadFilmKnownSet() {
-  try {
-    const raw = localStorage.getItem(FILM_KNOWN_LS_KEY);
-    if (!raw) return;
-    const arr = JSON.parse(raw);
-    if (Array.isArray(arr)) {
-      filmKnownKeySet = new Set(arr.filter(Boolean).map(v => String(v)));
-      filmBaselineReady = filmKnownKeySet.size > 0;
-    }
-  } catch {}
-}
-
-function saveFilmKnownSet() {
-  try {
-    // Cap raisonnable pour éviter un localStorage trop lourd
-    const arr = Array.from(filmKnownKeySet);
-    const capped = arr.length > 20000 ? arr.slice(-20000) : arr;
-    localStorage.setItem(FILM_KNOWN_LS_KEY, JSON.stringify(capped));
-  } catch {}
-}
-
-// --- Contenu partagé + delta session ---
-let sharedNewItems = [];              // ce que contient le fichier partagé (visible sur tous les PC)
-let sharedNewKeySet = new Set();      // clés (tvg-id/url) déjà dans le fichier partagé
-let sessionDeltaItems = [];           // nouveaux films détectés localement (à exporter)
-let sessionDeltaKeySet = new Set();   // dédupe session
-
-let showingSharedNew = false;
-let currentSharedNewIndex = -1;
-
-// Restaure les deltas non exportés (si tu recharges la page avant d'exporter)
-function loadPendingDelta() {
-  try {
-    const raw = localStorage.getItem(FILM_PENDING_LS_KEY);
-    if (!raw) return;
-    const obj = JSON.parse(raw);
-    const items = Array.isArray(obj?.items) ? obj.items : [];
-    sessionDeltaItems = items.slice(-SHARED_NEW_MAX);
-    sessionDeltaKeySet = new Set(sessionDeltaItems.map(it => filmKey(it)).filter(Boolean));
-  } catch {}
-}
-
-function persistPendingDelta() {
-  try {
-    localStorage.setItem(FILM_PENDING_LS_KEY, JSON.stringify({
-      v: 1,
-      savedAt: new Date().toISOString(),
-      items: sessionDeltaItems.slice(-SHARED_NEW_MAX)
-    }));
-  } catch {}
-}
-
-function clearPendingDelta() {
-  sessionDeltaItems = [];
-  sessionDeltaKeySet = new Set();
-  try { localStorage.removeItem(FILM_PENDING_LS_KEY); } catch {}
-}
-
-function _stripForSharedNew(entry) {
-  const k = filmKey(entry);
-  return {
-    tvgId: entry?.tvgId ?? null,
-    name: entry?.name ?? '',
-    url: entry?.url ? String(entry.url) : '',
-    group: entry?.group ?? '',
-    logo: entry?.logo ?? null,
-    addedAt: new Date().toISOString(),
-    _key: k
-  };
-}
-
-async function loadSharedNewFromRepo() {
-  try {
-    const res = await fetch(SHARED_NEW_JSON_PATH + '?_=' + Date.now());
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    const items = Array.isArray(data?.items) ? data.items : [];
-    sharedNewItems = items.map(it => ({
-      tvgId: it?.tvgId ?? null,
-      name: it?.name ?? '',
-      url: it?.url ? String(it.url) : '',
-      group: it?.group ?? '',
-      logo: it?.logo ?? null,
-      addedAt: it?.addedAt ?? null,
-      _key: filmKey(it)
-    })).filter(it => it.url || it.tvgId);
-    sharedNewKeySet = new Set(sharedNewItems.map(it => it._key).filter(Boolean));
-  } catch {
-    // si le fichier n'existe pas encore, on garde vide
-    sharedNewItems = [];
-    sharedNewKeySet = new Set();
-  }
-  updateNewBtnLabel();
-  if (showingSharedNew) renderSharedNewList();
-}
-
-// JSON delta = uniquement les nouveaux films de la session
-function buildSharedDeltaJson() {
-  return {
-    type: 'shared-history',
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    items: sessionDeltaItems.slice(-SHARED_NEW_MAX).map(it => ({
-      tvgId: it?.tvgId ?? null,
-      name: it?.name ?? '',
-      url: it?.url ?? '',
-      group: it?.group ?? '',
-      logo: it?.logo ?? null,
-      addedAt: it?.addedAt ?? new Date().toISOString()
-    }))
-  };
-}
-
-function downloadJson(filename, obj) {
-  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json;charset=utf-8' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 500);
-}
-
-function exportSharedNewDelta() {
-  if (!sessionDeltaItems.length) {
-    toast ? toast('Aucun nouveau film à exporter') : alert('Aucun nouveau film à exporter');
-    return;
-  }
-  downloadJson('shared-last-added.json', buildSharedDeltaJson());
-
-  // IMPORTANT : après export, on vide la file des "nouveaux"
-  clearPendingDelta();
-  persistPendingDelta();
-  updateNewBtnLabel();
-
-  toast ? toast('JSON exporté : shared-last-added.json (à commit)') : null;
-}
-
-function exportSharedNewEmpty() {
-  downloadJson('shared-last-added.json', {
-    type: 'shared-history',
-    version: 1,
-    generatedAt: new Date().toISOString(),
-    items: []
-  });
-  toast ? toast('JSON vide exporté : shared-last-added.json') : null;
-}
-
-function updateNewBtnLabel() {
-  const btn = document.getElementById('toggleNewBtn');
-  if (!btn) return;
-  const pending = sessionDeltaItems.length;
-  btn.textContent = pending > 0 ? `🆕 Derniers ajouts (${pending})` : '🆕 Derniers ajouts';
-  btn.classList.toggle('has-pending', pending > 0);
-  btn.classList.toggle('is-active', showingSharedNew);
-}
-
-// Détecte un "nouveau film" UNIQUEMENT si son tvg-id (ou URL fallback) n'a jamais été vu sur CET appareil.
-function registerDeltaIfNeeded(listType, entry) {
-  if (listType !== 'channels') return; // Film M3U uniquement
-
-  const key = filmKey(entry);
-  if (!key) return;
-
-  // Phase "baseline" : 1er gros chargement -> on enregistre sans marquer "nouveau"
-  if (baselineInitializing) {
-    filmKnownKeySet.add(key);
-    return;
-  }
-
-  // Si déjà connu localement, ce n'est pas un nouvel ajout
-  if (filmKnownKeySet.has(key)) return;
-
-  // Marquer comme connu
-  filmKnownKeySet.add(key);
-
-  // Si déjà présent dans le fichier partagé, inutile d'exporter
-  if (sharedNewKeySet.has(key)) return;
-
-  // Dédup session
-  if (sessionDeltaKeySet.has(key)) return;
-
-  const stripped = { ..._stripForSharedNew(entry), listType: 'channels' };
-  sessionDeltaKeySet.add(key);
-  sessionDeltaItems.push(stripped);
-
-  // limite
-  if (sessionDeltaItems.length > SHARED_NEW_MAX) {
-    const trimmed = sessionDeltaItems.slice(-SHARED_NEW_MAX);
-    sessionDeltaItems = trimmed;
-    sessionDeltaKeySet = new Set(trimmed.map(it => filmKey(it)).filter(Boolean));
-  }
-
-  persistPendingDelta();
-  saveFilmKnownSet();
-  updateNewBtnLabel();
-}
-
-// init local stores
-loadFilmKnownSet();
-loadPendingDelta();
-function renderSharedNewList() {
-  if (!channelListEl) return;
-  channelListEl.innerHTML = '';
-  const list = sharedNewItems.filter(it => matchesSearch(it));
-  list.forEach((entry, idx) => {
-    channelListEl.appendChild(createChannelElement(entry, idx, 'sharedNew'));
-  });
-}
-
-function playSharedNew(index) {
-  if (index < 0 || index >= sharedNewItems.length) return;
-  currentListType = 'sharedNew';
-  currentSharedNewIndex = index;
-  const entry = sharedNewItems[index];
-  playUrl(entry);
-  renderSharedNewList();
-  if (favoriteListEl?.classList.contains('active')) renderFavoritesList();
-  scrollToActiveItem();
-}
-
-async function toggleSharedNewView() {
-  showingSharedNew = !showingSharedNew;
-
-  if (showingSharedNew) {
-    await loadSharedNewFromRepo();
-updateFilmToolsVisibility();
-    // forcer l’onglet Films actif
-    currentListType = 'sharedNew';
-    renderSharedNewList();
-    setStatus?.('🆕 Derniers ajouts');
-  } else {
-    // retour liste normale (Film)
-    currentListType = 'channels';
-    renderChannelList();
-    setStatus?.('Liste Films');
-  }
-  updateNewBtnLabel();
-}
-
-/** Ingestion générique (ajoute, marque "nouveau", notifie) */
-function ingestEntries(listType, entries, targetArr) {
-  if (!Array.isArray(entries) || !entries.length) return { added: 0, newlyUnread: 0 };
-
-  let added = 0;
-  let newlyUnread = 0;
-
-  // Baseline Film M3U : si c'est le 1er gros chargement (liste vide + pas d'historique local)
-  // on enregistre les clés connues sans considérer que ce sont des "nouveaux ajouts".
-  const beforeLen = Array.isArray(targetArr) ? targetArr.length : 0;
-  const shouldBaseline =
-    (listType === 'channels') &&
-    (!filmBaselineReady) &&
-    (filmKnownKeySet.size === 0) &&
-    (beforeLen === 0) &&
-    (entries.length > 5);
-
-  if (shouldBaseline) baselineInitializing = true;
-
-  for (const e of entries) {
-    const url = e?.url ? String(e.url) : '';
-    if (!url) continue;
-
-    // Dédup robuste pour Film : tvg-id d'abord, sinon URL
-    if (listType === 'channels') {
-      const k = filmKey(e);
-      if (k && hasFilmKeyInList(targetArr, k)) continue;
-    } else {
-      if (hasUrlInList(targetArr, url)) continue;
-    }
-
-    targetArr.push(e);
-
-    // attach listType for badges/seen tracking
-    try { if (e && !e.listType) e.listType = listType; } catch {}
-    try { registerDeltaIfNeeded(listType, e); } catch {}
-
-    added += 1;
-
-    // Unread tracking (garde ton comportement existant)
-    if (url && !isSeen(listType, url)) {
-      if (!isUnread(listType, url)) newlyUnread += 1;
-      markUnread(listType, url);
-    }
-  }
-
-  // Fin baseline
-  if (shouldBaseline) {
-    baselineInitializing = false;
-    filmBaselineReady = true;
-    saveFilmKnownSet();
-    // Par sécurité, si un ancien état avait laissé un delta, on nettoie.
-    clearPendingDelta();
-    persistPendingDelta();
-    updateNewBtnLabel();
-    toast ? toast('Base Film initialisée (les prochains ajouts seront détectés)') : null;
-  } else if (listType === 'channels') {
-    // Film : on persiste l'état connu au fil de l'eau
-    saveFilmKnownSet();
-  }
-
-  if (added > 0) {
-    renderLists();
-    updateTabBadges();
-    if (newlyUnread > 0) toast(`+${newlyUnread} ajout(s) nouveau(x)`);
-  }
-  return { added, newlyUnread };
-}
-
-function markEntrySeenFromAnySource(entry) {
-  if (!entry) return;
-  const lt = keyForListType(entry.listType || currentListType || 'channels');
-  if (entry.url) markSeen(lt, String(entry.url));
-}
-
-/* -------------------------
-   SUPABASE SYNC (chiffrée)
-   ------------------------- */
-
-let supabaseClient = null;
-let syncEnabled = false;
-let syncDocId = null;
-let syncCode = null;
-let syncPullInFlight = false;
-let syncPushTimer = null;
-
-function loadSupabaseCfg() {
-  try {
-    const raw = localStorage.getItem(SUPABASE_CFG_KEY);
-    if (!raw) return null;
-    const cfg = JSON.parse(raw);
-    if (!cfg || !cfg.url || !cfg.anonKey) return null;
-    return cfg;
-  } catch {
-    return null;
-  }
-}
-
-function saveSupabaseCfg(url, anonKey) {
-  try {
-    localStorage.setItem(SUPABASE_CFG_KEY, JSON.stringify({ url, anonKey }));
-  } catch {}
-}
-
-async function sha256Bytes(str) {
-  const buf = new TextEncoder().encode(str);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return new Uint8Array(digest);
-}
-
-function b64url(bytes) {
-  const bin = String.fromCharCode(...bytes);
-  const b64 = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-  return b64;
-}
-function unb64url(s) {
-  const pad = s.length % 4 ? '='.repeat(4 - (s.length % 4)) : '';
-  const b64 = s.replace(/-/g, '+').replace(/_/g, '/') + pad;
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-async function deriveAesKeyFromCode(code, saltBytes) {
-  const baseKey = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(code),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveKey']
-  );
-
-  return crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      salt: saltBytes,
-      iterations: 120000,
-      hash: 'SHA-256'
-    },
-    baseKey,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-async function encryptState(code, docId, stateObj) {
-  const salt = await sha256Bytes('tron-ares:' + docId);
-  const key = await deriveAesKeyFromCode(code, salt);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = new TextEncoder().encode(JSON.stringify(stateObj));
-  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain));
-  return b64url(iv) + '.' + b64url(cipher);
-}
-
-async function decryptState(code, docId, payload) {
-  const [ivB64, cipherB64] = String(payload || '').split('.');
-  if (!ivB64 || !cipherB64) throw new Error('Payload invalide');
-  const salt = await sha256Bytes('tron-ares:' + docId);
-  const key = await deriveAesKeyFromCode(code, salt);
-  const iv = unb64url(ivB64);
-  const cipher = unb64url(cipherB64);
-  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipher);
-  const plain = new TextDecoder().decode(plainBuf);
-  return JSON.parse(plain);
-}
-
-function mergeStates(local, remote) {
-  if (!remote || typeof remote !== 'object') return local;
-  const out = JSON.parse(JSON.stringify(local));
-
-  for (const lt of ['channels', 'fr', 'iframe']) {
-    out.seen[lt] = out.seen[lt] || {};
-    out.unread[lt] = out.unread[lt] || {};
-
-    const rSeen = remote.seen?.[lt] || {};
-    for (const url of Object.keys(rSeen)) {
-      const t = Number(rSeen[url] || 0);
-      const cur = Number(out.seen[lt][url] || 0);
-      if (t > cur) out.seen[lt][url] = t;
-    }
-
-    const rUnread = remote.unread?.[lt] || {};
-    for (const url of Object.keys(rUnread)) {
-      if (out.seen[lt][url]) continue;
-      const t = Number(rUnread[url] || 0) || Date.now();
-      const cur = Number(out.unread[lt][url] || 0);
-      if (!cur || t < cur) out.unread[lt][url] = t;
-    }
-
-    // Nettoyage
-    for (const url of Object.keys(out.unread[lt])) {
-      if (out.seen[lt][url]) delete out.unread[lt][url];
-    }
-  }
-
-  out.updatedAt = Math.max(Number(local.updatedAt || 0), Number(remote.updatedAt || 0), Date.now());
-  return out;
-}
-
-function initSupabaseIfPossible() {
-  const cfg = loadSupabaseCfg();
-  if (!cfg || !cfg.url || !cfg.anonKey) return null;
-  if (!window.supabase || !window.supabase.createClient) return null;
-  try {
-    return window.supabase.createClient(cfg.url, cfg.anonKey);
-  } catch {
-    return null;
-  }
-}
-
-async function computeDocIdFromCode(code) {
-  const h = await sha256Bytes('tron-ares-doc:' + code);
-  return b64url(h).slice(0, 32);
-}
-
-function setSyncStatus(text) {
-  if (syncStatus) syncStatus.textContent = text;
-}
-
-async function syncConnect(code) {
-  if (!code || code.length < 4) {
-    toast('Code de sync trop court');
-    return;
-  }
-  if (!crypto?.subtle) {
-    toast('WebCrypto indisponible (navigateur trop ancien)');
-    return;
-  }
-
-  supabaseClient = initSupabaseIfPossible();
-  if (!supabaseClient) {
-    toast('Configure Supabase dans la fenêtre Sync');
-    return;
-  }
-
-  syncCode = code;
-  syncDocId = await computeDocIdFromCode(code);
-  syncEnabled = true;
-
-  try { localStorage.setItem(SYNC_CODE_KEY, code); } catch {}
-
-  setSyncStatus('Sync : connexion…');
-  await syncPull(true);
-  setSyncStatus('Sync : active');
-  toast('Sync activée');
-  scheduleSyncPush();
-}
-
-function syncDisconnect() {
-  syncEnabled = false;
-  syncDocId = null;
-  syncCode = null;
-  if (syncPushTimer) { clearTimeout(syncPushTimer); syncPushTimer = null; }
-  try { localStorage.removeItem(SYNC_CODE_KEY); } catch {}
-  setSyncStatus('Sync : inactive');
-  toast('Sync désactivée');
-}
-
-async function syncPull(showToast) {
-  if (!syncEnabled || !supabaseClient || !syncDocId || !syncCode) return;
-  if (syncPullInFlight) return;
-  syncPullInFlight = true;
-
-  try {
-    const { data, error } = await supabaseClient
-      .from('tron_state')
-      .select('payload, updated_at')
-      .eq('id', syncDocId)
-      .maybeSingle();
-
-    if (error) {
-      console.warn('Sync pull error', error);
-      if (showToast) toast('Erreur sync (pull)');
-      return;
-    }
-
-    if (data && data.payload) {
-      const remote = await decryptState(syncCode, syncDocId, data.payload);
-      const merged = mergeStates(newState, remote);
-      newState = merged;
-      try { localStorage.setItem(NEWSTATE_KEY, JSON.stringify(newState)); } catch {}
-      updateTabBadges();
-      // Rerender pour afficher les badges "Nouveau"
-      renderLists();
-      if (showToast) toast('Sync : état mis à jour');
-    }
-  } catch (e) {
-    console.warn('Sync pull failed', e);
-    if (showToast) toast('Erreur sync (decrypt)');
-  } finally {
-    syncPullInFlight = false;
-  }
-}
-
-async function syncPush() {
-  if (!syncEnabled || !supabaseClient || !syncDocId || !syncCode) return;
-  try {
-    const payload = await encryptState(syncCode, syncDocId, newState);
-    const { error } = await supabaseClient
-      .from('tron_state')
-      .upsert({ id: syncDocId, payload, updated_at: new Date().toISOString() }, { onConflict: 'id' });
-    if (error) {
-      console.warn('Sync push error', error);
-      setSyncStatus('Sync : erreur push');
-      return;
-    }
-    setSyncStatus('Sync : active (OK)');
-  } catch (e) {
-    console.warn('Sync push failed', e);
-    setSyncStatus('Sync : erreur push');
-  }
-}
-
-function scheduleSyncPush() {
-  if (!syncEnabled) return;
-  if (syncPushTimer) clearTimeout(syncPushTimer);
-  syncPushTimer = setTimeout(() => {
-    syncPushTimer = null;
-    syncPush();
-  }, 900);
-}
-
-/** Pull périodique */
-setInterval(() => {
-  if (syncEnabled) syncPull(false);
-}, 15000);
-
-
-
 let currentIndex = -1;
 let currentFrIndex = -1;
 let currentIframeIndex = -1;
 
-let favoritesView = [];   // [{ id, sourceType, sourceIndex, entry }]
+let favoritesView = [];
+
+// =====================================================
+// 🆕 Derniers ajouts (JSON ids + filtre sur tvg-id)
+// =====================================================
+const NEW_ADDITIONS_JSON = 'nouveaux_items.json';
+const MAX_NEW_ADDITIONS = 20;
+let newAdditionsIds = [];
+let newAdditionsMode = false;
+
+function getActiveTabKey(){
+  return document.querySelector('.tab-btn.active')?.dataset?.tab || '';
+}
+
+async function fetchNewAdditionsIds(){
+  try{
+    const res = await fetch(NEW_ADDITIONS_JSON + '?_=' + Date.now());
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const ids = Array.isArray(data?.ids) ? data.ids : [];
+    const clean = ids.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim());
+    if(clean.length > MAX_NEW_ADDITIONS){
+      console.warn(`[Derniers ajouts] Limite ${MAX_NEW_ADDITIONS} atteinte: ${clean.length} IDs dans le JSON. Les plus anciens sont ignorés.`);
+    }
+    newAdditionsIds = clean.slice(0, MAX_NEW_ADDITIONS);
+  }catch(err){
+    console.warn('[Derniers ajouts] JSON introuvable ou invalide:', err);
+    newAdditionsIds = [];
+  }
+}
+
+function computeNewAdditionsIndexes(){
+  if(!newAdditionsIds.length) return [];
+  // Préserve l'ordre du JSON (mets tes IDs du plus récent au plus ancien)
+  const idToIndex = new Map();
+  for(let i=0;i<channels.length;i++){
+    const tvgId = (channels[i]?.tvgId || '').trim();
+    if(tvgId) idToIndex.set(tvgId, i);
+  }
+
+  const out = [];
+  const seen = new Set();
+  for(const id of newAdditionsIds){
+    if(seen.has(id)) continue;
+    const idx = idToIndex.get(id);
+    if(typeof idx === 'number') out.push(idx);
+    seen.add(id);
+  }
+  return out;
+}
+
+function updateNewAdditionsButtonVisibility(){
+  if(!newAdditionsContainer || !newAdditionsBtn) return;
+
+  const isFilmTab = (getActiveTabKey() === 'channels');
+  if(!isFilmTab){
+    newAdditionsContainer.classList.add('hidden');
+    if(newAdditionsMode){
+      newAdditionsMode = false;
+      renderChannelList();
+    }
+    return;
+  }
+
+  newAdditionsContainer.classList.remove('hidden');
+
+  const count = computeNewAdditionsIndexes().length;
+  newAdditionsBtn.textContent = count ? `🆕 Derniers ajouts (${count})` : '🆕 Derniers ajouts';
+  // Le bouton reste cliquable même si la liste est vide
+  newAdditionsBtn.disabled = false;
+  newAdditionsBtn.style.opacity = (count === 0) ? '0.85' : '1';
+}
+
+function toggleNewAdditionsMode(){
+  if(getActiveTabKey() !== 'channels') return;
+  const count = computeNewAdditionsIndexes().length;
+  if(!count){
+    // rien à afficher
+    newAdditionsMode = true;
+  }else{
+    newAdditionsMode = !newAdditionsMode;
+  }
+  renderChannelList();
+  scrollToActiveItem();
+}
+
+   // [{ id, sourceType, sourceIndex, entry }]
 let currentFavPos = -1;   // position dans favoritesView
 
 // FR par défaut
@@ -1014,6 +371,34 @@ const channelFrListEl = document.getElementById('channelFrList');
 const channelListEl = document.getElementById('channelList');
 const iframeListEl = document.getElementById('iframeList');
 const favoriteListEl = document.getElementById('favoriteList');
+
+const newAdditionsContainer = document.getElementById('newAdditionsContainer');
+const newAdditionsBtn = document.getElementById('newAdditionsBtn');
+
+// =====================================================
+// 🆕 Derniers ajouts - INIT (après DOM refs)
+// =====================================================
+(async () => {
+  // Charge la liste d'IDs "nouveaux" depuis le JSON (shared pour tous les PC)
+  await fetchNewAdditionsIds();
+  updateNewAdditionsButtonVisibility();
+
+  // Clic sur 🆕 : refresh JSON + bascule mode "Derniers ajouts"
+  if (newAdditionsBtn) {
+    newAdditionsBtn.addEventListener('click', async () => {
+      await fetchNewAdditionsIds();           // refresh à chaque clic (pratique après un commit)
+      updateNewAdditionsButtonVisibility();
+      toggleNewAdditionsMode();
+    });
+  }
+
+  // Quand tu changes d'onglet, on masque/affiche le bouton (après le switch de l'app)
+  document.addEventListener('click', (e) => {
+    if (e.target && e.target.closest && e.target.closest('.tab-btn')) {
+      setTimeout(() => updateNewAdditionsButtonVisibility(), 0);
+    }
+  }, true);
+})();
 
 const statusPill = document.getElementById('statusPill');
 const npLogo = document.getElementById('npLogo');
@@ -1086,27 +471,6 @@ const castLauncher = document.getElementById('castLauncher');
 const globalSearchInput = document.getElementById('globalSearchInput');
 const clearSearchBtn = document.getElementById('clearSearchBtn');
 const verifyLinksBtn = document.getElementById('verifyLinksBtn');
-
-// --- 🆕 Derniers ajouts (Film M3U) partagé via shared-last-added.json ---
-const toggleNewBtn = document.getElementById('toggleNewBtn');
-const exportSharedDeltaBtn = document.getElementById('exportSharedDeltaBtn');
-const exportSharedEmptyBtn = document.getElementById('exportSharedEmptyBtn');
-const reloadSharedNewBtn = document.getElementById('reloadSharedNewBtn');
-
-// --- Nouveaux ajouts + Sync ---
-const toastEl = document.getElementById('toast');
-const openSyncBtn = document.getElementById('openSyncBtn');
-const syncModal = document.getElementById('syncModal');
-const closeSyncBtn = document.getElementById('closeSyncBtn');
-const syncCodeInput = document.getElementById('syncCodeInput');
-const syncConnectBtn = document.getElementById('syncConnectBtn');
-const syncDisconnectBtn = document.getElementById('syncDisconnectBtn');
-const syncStatus = document.getElementById('syncStatus');
-const supabaseUrlInput = document.getElementById('supabaseUrlInput');
-const supabaseAnonKeyInput = document.getElementById('supabaseAnonKeyInput');
-const saveSupabaseCfgBtn = document.getElementById('saveSupabaseCfgBtn');
-const tabNewCountEls = Array.from(document.querySelectorAll('.tab-new-count'));
-
 
 // --- MINI RADIO R.ALFA + LUNA (postMessage) ---
 const miniRadioEl = document.getElementById('miniRadioPlayer');
@@ -1918,7 +1282,6 @@ function renderLists() {
 
 function refreshActiveListsUI() {
   if (currentListType === 'channels') renderChannelList();
-  else if (currentListType === 'sharedNew') renderSharedNewList();
   else if (currentListType === 'fr') renderChannelFrList();
   else if (currentListType === 'iframe') renderIframeList();
   else if (currentListType === 'favorites') renderFavoritesList();
@@ -1941,6 +1304,74 @@ function renderChannelFrList() {
 function renderChannelList() {
   if (!channelListEl) return;
   channelListEl.innerHTML = '';
+
+  // Bouton visible uniquement sur l'onglet Films
+  updateNewAdditionsButtonVisibility();
+
+  // Mode "Derniers ajouts" : on affiche seulement les items dont tvg-id est dans le JSON
+  if (newAdditionsMode) {
+    const header = document.createElement('div');
+    header.style.display = 'flex';
+    header.style.justifyContent = 'space-between';
+    header.style.alignItems = 'center';
+    header.style.gap = '8px';
+    header.style.padding = '6px 6px 10px';
+
+    const title = document.createElement('div');
+    title.style.fontSize = '10px';
+    title.style.textTransform = 'uppercase';
+    title.style.letterSpacing = '.14em';
+    title.style.color = 'var(--tron-muted)';
+    title.textContent = 'Derniers ajouts';
+
+    const backBtn = document.createElement('button');
+    backBtn.className = 'btn btn-ghost';
+    backBtn.type = 'button';
+    backBtn.textContent = '↩ Retour Films';
+    backBtn.addEventListener('click', () => {
+      newAdditionsMode = false;
+      renderChannelList();
+      scrollToActiveItem();
+    });
+
+    header.appendChild(title);
+    header.appendChild(backBtn);
+    channelListEl.appendChild(header);
+
+    const idxs = computeNewAdditionsIndexes();
+    if (!idxs.length) {
+      const empty = document.createElement('div');
+      empty.style.textAlign = 'center';
+      empty.style.padding = '14px 10px';
+      empty.style.color = 'var(--tron-muted)';
+            const hasIds = Array.isArray(newAdditionsIds) && newAdditionsIds.length > 0;
+      if (hasIds) {
+        empty.textContent = 'Aucun film trouvé pour les IDs indiqués dans nouveaux_items.json';
+        const hint = document.createElement('div');
+        hint.style.marginTop = '6px';
+        hint.style.fontSize = '11px';
+        hint.style.opacity = '0.9';
+        hint.style.whiteSpace = 'pre-wrap';
+        hint.style.wordBreak = 'break-word';
+        hint.textContent = 'IDs: ' + newAdditionsIds.join(', ');
+        channelListEl.appendChild(empty);
+        channelListEl.appendChild(hint);
+        return;
+      }
+      empty.textContent = 'Aucun nouveau film pour le moment 🎞️';
+      channelListEl.appendChild(empty);
+      return;
+    }
+
+    idxs.forEach((idx) => {
+      const ch = channels[idx];
+      if (!ch) return;
+      if (!matchesSearch(ch)) return;
+      channelListEl.appendChild(createChannelElement(ch, idx, 'channels'));
+    });
+    return;
+  }
+
   channels.forEach((ch, idx) => {
     if (!matchesSearch(ch)) return;
     channelListEl.appendChild(createChannelElement(ch, idx, 'channels'));
@@ -2006,11 +1437,9 @@ function createChannelElement(entry, index, sourceType) {
   li.dataset.type = sourceType;
   li.dataset.url = entry?.url ? String(entry.url) : '';
   li.dataset.linkkey = linkKeyForEntry(entry);
-  li.dataset.url = entry?.url ? String(entry.url) : '';
-  li.dataset.linkkey = linkKeyForEntry(entry);
 
   // ✅ Une seule source de vérité pour "active"
-  const isActive = !!currentEntry && _entryMatch(currentEntry, entry);
+  const isActive = !!currentEntry && currentEntry.id === entry.id;
   if (isActive) li.classList.add('active');
 
   const logoDiv = document.createElement('div');
@@ -2018,6 +1447,8 @@ function createChannelElement(entry, index, sourceType) {
 
   if (entry.logo && entry.logo.type === 'image') {
     const img = document.createElement('img');
+    img.loading = 'lazy';
+    img.decoding = 'async';
     img.src = entry.logo.value;
     img.alt = entry.name || '';
     logoDiv.appendChild(img);
@@ -2045,18 +1476,10 @@ function createChannelElement(entry, index, sourceType) {
   titleRow.appendChild(numDiv);
   titleRow.appendChild(titleDiv);
   titleRow.appendChild(statusBadge);
+  titleRow.appendChild(statusBadge);
+  titleRow.appendChild(statusBadge);
 
-  // Badge \"Nouveau\" (persistant)
-  try {
-    const lt = (entry && entry.listType) ? entry.listType : sourceType;
-    if (entry?.url && isUnread(lt, String(entry.url))) {
-      const nb = document.createElement('span');
-      nb.className = 'new-badge';
-      nb.textContent = 'NOUVEAU';
-      titleRow.appendChild(nb);
-    }
-  } catch {}
-const subDiv = document.createElement('div');
+  const subDiv = document.createElement('div');
   subDiv.className = 'channel-sub';
   subDiv.textContent = entry.group || (entry.isIframe ? 'Overlay / iFrame' : 'Flux M3U');
 
@@ -2084,22 +1507,19 @@ const subDiv = document.createElement('div');
   const actionsDiv = document.createElement('div');
   actionsDiv.className = 'channel-actions';
 
-  let favBtn = null;
-  if (sourceType !== 'sharedNew') {
-    favBtn = document.createElement('button');
-    favBtn.className = 'icon-btn';
-    favBtn.innerHTML = '★';
-    favBtn.title = 'Ajouter / enlever des favoris';
-    favBtn.dataset.fav = entry.isFavorite ? 'true' : 'false';
+  const favBtn = document.createElement('button');
+  favBtn.className = 'icon-btn';
+  favBtn.innerHTML = '★';
+  favBtn.title = 'Ajouter / enlever des favoris';
+  favBtn.dataset.fav = entry.isFavorite ? 'true' : 'false';
 
-    favBtn.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      entry.isFavorite = !entry.isFavorite;
-      favBtn.dataset.fav = entry.isFavorite ? 'true' : 'false';
-      refreshActiveListsUI();
-      renderFavoritesList();
-    });
-  }
+  favBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    entry.isFavorite = !entry.isFavorite;
+    favBtn.dataset.fav = entry.isFavorite ? 'true' : 'false';
+    refreshActiveListsUI();
+    renderFavoritesList();
+  });
 
   const ovBtn = document.createElement('button');
   ovBtn.className = 'icon-btn';
@@ -2114,7 +1534,6 @@ const subDiv = document.createElement('div');
     if (sourceType === 'channels') currentIndex = index;
     else if (sourceType === 'fr') currentFrIndex = index;
     else if (sourceType === 'iframe') currentIframeIndex = index;
-    else if (sourceType === 'sharedNew') currentSharedNewIndex = index;
 
     activePlaybackMode = 'iframe';
     playEntryAsOverlay(entry);
@@ -2124,7 +1543,7 @@ const subDiv = document.createElement('div');
     scrollToActiveItem();
   });
 
-  if (favBtn) actionsDiv.appendChild(favBtn);
+  actionsDiv.appendChild(favBtn);
   actionsDiv.appendChild(ovBtn);
 
   li.appendChild(logoDiv);
@@ -2135,10 +1554,8 @@ const subDiv = document.createElement('div');
     if (sourceType === 'channels') playChannel(index);
     else if (sourceType === 'fr') playFrChannel(index);
     else if (sourceType === 'iframe') playIframe(index);
-    else if (sourceType === 'sharedNew') playSharedNew(index);
   });
 
-  hydrateBadgeFromCache(li, entry);
   hydrateBadgeFromCache(li, entry);
   return li;
 }
@@ -2606,7 +2023,6 @@ function refreshTrackMenus() {
     activeSubtitleIndex = -1;
     closeAllTrackMenus();
     updateTrackControlsVisibility();
-    updateFilmToolsVisibility();
     return;
   }
 
@@ -2660,9 +2076,6 @@ function playEntryAsOverlay(entry) {
   if (!entry || !entry.url) return;
 
   currentEntry = entry;
-  // ✅ Marquer comme "vu" (supprime le badge "Nouveau")
-  try { markEntrySeenFromAnySource(entry); } catch {}
-
   activePlaybackMode = 'iframe';
 
   updateNowPlayingCounter();
@@ -2697,9 +2110,6 @@ function fallbackToExternalPlayer(entry) {
   showIframe();
 
   currentEntry = entry;
-  // ✅ Marquer comme "vu" (supprime le badge "Nouveau")
-  try { markEntrySeenFromAnySource(entry); } catch {}
-
   updateNowPlayingCounter();
 
   const base = 'https://vsalema.github.io/play/?';
@@ -2718,9 +2128,6 @@ if (typeof radioPlaying !== 'undefined' && radioPlaying) {
 }
 
 currentEntry = entry;
-  // ✅ Marquer comme "vu" (supprime le badge "Nouveau")
-  try { markEntrySeenFromAnySource(entry); } catch {}
-
   // Met à jour tout de suite l'affichage des contrôles pistes (évite tout clignotement)
   updateTrackControlsVisibility();
   updateNowPlayingCounter();
@@ -2895,13 +2302,6 @@ function playNext() {
     return;
   }
 
-  if (currentListType === 'sharedNew') {
-    if (!sharedNewItems.length) return;
-    if (currentSharedNewIndex === -1) playSharedNew(0);
-    else playSharedNew((currentSharedNewIndex + 1) % sharedNewItems.length);
-    return;
-  }
-
   if (currentListType === 'fr') {
     if (!frChannels.length) return;
     if (currentFrIndex === -1) playFrChannel(0);
@@ -2930,13 +2330,6 @@ function playPrev() {
     playUrl(item.entry);
     renderFavoritesList();
     scrollToActiveItem();
-    return;
-  }
-
-  if (currentListType === 'sharedNew') {
-    if (!sharedNewItems.length) return;
-    if (currentSharedNewIndex === -1) playSharedNew(sharedNewItems.length - 1);
-    else playSharedNew((currentSharedNewIndex - 1 + sharedNewItems.length) % sharedNewItems.length);
     return;
   }
 
@@ -2999,8 +2392,8 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
     let name = 'Sans titre';
     let logo = null;
     let group = defaultGroup;
-    let tvgId = null;
-    let tvgName = null;
+    let tvgId = '';
+
 
     if (lastInf) {
       const nameMatch = lastInf.split(',').slice(-1)[0].trim();
@@ -3012,19 +2405,15 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
       const groupMatch = lastInf.match(/group-title="([^"]+)"/i);
       if (groupMatch) group = groupMatch[1];
 
-      const idMatch = lastInf.match(/tvg-id="([^"]+)"/i);
-      if (idMatch) tvgId = String(idMatch[1]).trim();
-
-      const tvgNameMatch = lastInf.match(/tvg-name="([^"]+)"/i);
-      if (tvgNameMatch) tvgName = String(tvgNameMatch[1]).trim();
+      const tvgIdMatch = lastInf.match(/tvg-id="([^"]+)"/i);
+      if (tvgIdMatch) tvgId = String(tvgIdMatch[1]).trim();
     }
 
     results.push({
       id: `${listType}-ch-${nextUid()}`,
+      tvgId,
       name,
       url,
-      tvgId,
-      tvgName,
       logo: normalizeLogo(logo, name),
       group,
       isIframe: isYoutubeUrl(url),
@@ -3041,7 +2430,7 @@ function parseM3U(content, listType = 'channels', defaultGroup = 'Playlist') {
 // =====================================================
 // LOADERS
 // =====================================================
-async function loadFromUrl(url) {
+async function loadFromUrl(url, opts = {}) {
   if (!url) return;
   setStatus('Chargement…');
 
@@ -3052,10 +2441,12 @@ async function loadFromUrl(url) {
 
       if (text.trim().startsWith('#EXTM3U')) {
         const parsed = parseM3U(text, 'channels', 'Playlist');
-        ingestEntries('channels', parsed, channels);
-
-        if (parsed.length && currentIndex === -1) {
-          playChannel(channels.length - parsed.length);
+        channels.push(...parsed);
+        if (!opts?.deferRender) {
+          renderLists();
+          if (parsed.length && currentIndex === -1) {
+            playChannel(channels.length - parsed.length);
+          }
         }
 
         setStatus('Playlist chargée (' + parsed.length + ' entrées)');
@@ -3102,7 +2493,7 @@ async function loadFromUrl(url) {
   }
 }
 
-async function loadFrM3u(url) {
+async function loadFrM3u(url, opts = {}) {
   try {
     const res = await fetch(url);
     const text = await res.text();
@@ -3113,7 +2504,8 @@ async function loadFrM3u(url) {
     }
 
     const parsed = parseM3U(text, 'fr', 'FR');
-    ingestEntries('fr', parsed, frChannels);
+    frChannels.push(...parsed);
+    if (!opts?.deferRender) renderLists();
     setStatus('Chaînes FR chargées : ' + parsed.length);
   } catch (e) {
     console.error('Erreur M3U FR', e);
@@ -3132,7 +2524,8 @@ function loadFromFile(file) {
     reader.onload = () => {
       const text = String(reader.result || '');
       const parsed = parseM3U(text, 'channels', 'Playlist locale');
-      ingestEntries('channels', parsed, channels);
+      channels.push(...parsed);
+      renderLists();
       if (parsed.length && currentIndex === -1) {
         playChannel(channels.length - parsed.length);
       }
@@ -3174,9 +2567,10 @@ function addIframeOverlay() {
     listType: 'iframe'
   };
 
-  ingestEntries('iframe', [entry], iframeItems);
+  iframeItems.push(entry);
   if (iframeTitleInput) iframeTitleInput.value = '';
   if (iframeUrlInput) iframeUrlInput.value = '';
+  renderLists();
   playIframe(iframeItems.length - 1);
   showIframe();
   setStatus('Overlay ajouté');
@@ -3233,8 +2627,6 @@ function importFromJson() {
     alert('JSON invalide : impossible de parser.');
     return;
   }
-  const _importBufferChannels = [];
-  const _importBufferIframes = [];
 
   if (!data || !Array.isArray(data.items)) {
     alert("Format JSON inattendu : il manque le tableau 'items'.");
@@ -3249,7 +2641,7 @@ function importFromJson() {
       const url = item?.url;
       if (!url) return;
 
-      _importBufferChannels.push({
+      channels.push({
         id: `json-${type}-${nextUid()}`,
         name,
         url,
@@ -3261,10 +2653,7 @@ function importFromJson() {
       });
     });
 
-    // Appliquer les imports (dédupe + nouveaux)
-  if (_importBufferChannels.length) ingestEntries('channels', _importBufferChannels, channels);
-  if (_importBufferIframes.length) ingestEntries('iframe', _importBufferIframes, iframeItems);
-  renderLists();
+    renderLists();
     setStatus('Import JSON M3U terminé (' + data.items.length + ' entrées)');
   } else if (type === 'iframe') {
     data.items.forEach((item, idx) => {
@@ -3272,7 +2661,7 @@ function importFromJson() {
       const url = item?.url;
       if (!url) return;
 
-      _importBufferIframes.push({
+      iframeItems.push({
         id: `json-${type}-${nextUid()}`,
         name,
         url,
@@ -3284,10 +2673,7 @@ function importFromJson() {
       });
     });
 
-    // Appliquer les imports (dédupe + nouveaux)
-  if (_importBufferChannels.length) ingestEntries('channels', _importBufferChannels, channels);
-  if (_importBufferIframes.length) ingestEntries('iframe', _importBufferIframes, iframeItems);
-  renderLists();
+    renderLists();
     setStatus('Import JSON iFrame terminé (' + data.items.length + ' entrées)');
   } else {
     alert("Type JSON inconnu : '" + type + "'. Utilise 'm3u' ou 'iframe'.");
@@ -3371,14 +2757,20 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       autoplayFirstInList(currentListType);
     }
 
-    scrollToActiveItem();
+        // 🆕 Derniers ajouts : bouton uniquement sur Films + refresh JSON quand on ouvre l'onglet
+    if (btn.dataset.tab === 'channels') {
+      fetchNewAdditionsIds().then(updateNewAdditionsButtonVisibility);
+    } else {
+      updateNewAdditionsButtonVisibility();
+    }
+
+scrollToActiveItem();
     updateNowPlayingCounter();
     updateTrackControlsVisibility();
-    updateFilmToolsVisibility();
   });
 });
 
-// Recherche globale + clear
+// Recherche globale + clear (debounce + rendu seulement de l’onglet actif)
 if (globalSearchInput) {
   const wrapper = globalSearchInput.closest('.search-wrapper');
   const syncWrapper = () => {
@@ -3386,14 +2778,30 @@ if (globalSearchInput) {
     wrapper.classList.toggle('has-text', globalSearchInput.value.length > 0);
   };
 
+  const renderActiveTabList = () => {
+    const tab = (typeof getActiveTabKey === 'function') ? getActiveTabKey() : '';
+    if (tab === 'channels') return renderChannelList();
+    if (tab === 'fr') return renderChannelFrList();
+    if (tab === 'iframes') return renderIframeList();
+    if (tab === 'favorites') return renderFavoritesList();
+    return renderLists();
+  };
+
+  let debounceTimer = null;
+
   syncWrapper();
   globalSearchInput.addEventListener('input', () => {
     currentSearch = globalSearchInput.value.trim().toLowerCase();
     syncWrapper();
-    renderLists();
-    scrollToActiveItem();
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      renderActiveTabList();
+      scrollToActiveItem();
+    }, 120);
   });
 }
+
 
 if (clearSearchBtn && globalSearchInput) {
   clearSearchBtn.addEventListener('click', (ev) => {
@@ -3406,41 +2814,6 @@ if (clearSearchBtn && globalSearchInput) {
     scrollToActiveItem();
   });
 }
-
-// 🆕 Derniers ajouts (Film M3U) — toggle / export / vider / recharger
-if (toggleNewBtn) {
-  toggleNewBtn.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    toggleSharedNewView();
-  });
-}
-
-if (exportSharedDeltaBtn) {
-  exportSharedDeltaBtn.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    exportSharedNewDelta();
-  });
-}
-
-if (exportSharedEmptyBtn) {
-  exportSharedEmptyBtn.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    exportSharedNewEmpty();
-  });
-}
-
-if (reloadSharedNewBtn) {
-  reloadSharedNewBtn.addEventListener('click', async (ev) => {
-    ev.stopPropagation();
-    await loadSharedNewFromRepo();
-    if (showingSharedNew) renderSharedNewList();
-    toast ? toast('Historique partagé rechargé') : null;
-  });
-}
-
-// Charger l'historique partagé au démarrage (pour dédupe delta)
-loadSharedNewFromRepo();
-
 // Vérifier liens (liste active)
 if (verifyLinksBtn) {
   verifyLinksBtn.addEventListener('click', async () => {
@@ -3459,7 +2832,6 @@ if (verifyLinksBtn) {
       if (type === 'channels') entry = channels[index];
       else if (type === 'fr') entry = frChannels[index];
       else if (type === 'iframe') entry = iframeItems[index];
-      else if (type === 'sharedNew') entry = sharedNewItems[index];
 
       const key = itemEl.dataset.linkkey || linkKeyForEntry(entry);
       if (entry && key && !unique.has(key)) unique.set(key, entry);
@@ -3506,49 +2878,6 @@ toggleSidebarBtn?.addEventListener('click', () => {
   toggleSidebarBtn.classList.toggle('active', !isCollapsed);
 });
 if (window.innerWidth <= 900) sidebar?.classList.add('collapsed');
-
-
-// Sync modal
-openSyncBtn?.addEventListener('click', () => {
-  if (!syncModal) return;
-  // Pré-remplir
-  const cfg = loadSupabaseCfg();
-  if (supabaseUrlInput && cfg?.url) supabaseUrlInput.value = cfg.url;
-  if (supabaseAnonKeyInput && cfg?.anonKey) supabaseAnonKeyInput.value = cfg.anonKey;
-  if (syncCodeInput) syncCodeInput.value = (localStorage.getItem(SYNC_CODE_KEY) || '');
-  syncModal.classList.remove('hidden');
-});
-
-closeSyncBtn?.addEventListener('click', () => syncModal?.classList.add('hidden'));
-syncModal?.addEventListener('click', (ev) => {
-  if (ev.target === syncModal) syncModal.classList.add('hidden');
-});
-
-saveSupabaseCfgBtn?.addEventListener('click', () => {
-  const url = (supabaseUrlInput?.value || '').trim();
-  const key = (supabaseAnonKeyInput?.value || '').trim();
-  if (!url || !key) { toast('URL/Key manquants'); return; }
-  saveSupabaseCfg(url, key);
-  toast('Config Supabase enregistrée');
-});
-
-syncConnectBtn?.addEventListener('click', () => {
-  const code = (syncCodeInput?.value || '').trim();
-  syncConnect(code);
-});
-
-syncDisconnectBtn?.addEventListener('click', () => {
-  syncDisconnect();
-});
-
-// Auto-connect si un code est mémorisé sur cet appareil
-try {
-  const storedCode = (localStorage.getItem(SYNC_CODE_KEY) || '').trim();
-  if (storedCode) {
-    // Essaye d'init la config si présente
-    setTimeout(() => syncConnect(storedCode), 350);
-  }
-} catch {}
 
 // URL loader
 loadUrlBtn?.addEventListener('click', () => loadFromUrl(urlInput?.value.trim()));
@@ -3713,26 +3042,78 @@ videoEl?.addEventListener('error', () => {
 });
 
 // ✅ Sauvegarde reprise : basée sur l’entrée réellement en lecture
+// ✅ Sauvegarde reprise : basée sur l’entrée réellement en lecture (throttled pour éviter les freezes)
+let _lastResumeWriteMs = 0;
+let _resumeSaveScheduled = false;
+
+function _flushResumePositions() {
+  try { localStorage.setItem('tronAresResume', JSON.stringify(resumePositions)); } catch (_) {}
+}
+
+function _scheduleResumeSave(force = false) {
+  if (force) {
+    _flushResumePositions();
+    _lastResumeWriteMs = Date.now();
+    _resumeSaveScheduled = false;
+    return;
+  }
+
+  const now = Date.now();
+  // max ~1 écriture / 4s
+  if (now - _lastResumeWriteMs < 4000) return;
+  if (_resumeSaveScheduled) return;
+  _resumeSaveScheduled = true;
+
+  const run = () => {
+    _resumeSaveScheduled = false;
+    _flushResumePositions();
+    _lastResumeWriteMs = Date.now();
+  };
+
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(run, { timeout: 1200 });
+  } else {
+    setTimeout(run, 350);
+  }
+}
+
 videoEl?.addEventListener('timeupdate', () => {
   if (!currentEntry) return;
   if (currentEntry.listType !== 'channels') return;
 
   const key = currentEntry.url;
+  if (!key) return;
 
   if (!videoEl.duration || !isFinite(videoEl.duration) || videoEl.duration < 60) return;
 
   const t = videoEl.currentTime;
   if (t < 10) return;
 
+  // Si on est proche de la fin → on supprime la reprise et on flush tout de suite
   if (videoEl.duration - t < 20) {
-    delete resumePositions[key];
-    localStorage.setItem('tronAresResume', JSON.stringify(resumePositions));
+    if (resumePositions[key] !== undefined) {
+      delete resumePositions[key];
+      _scheduleResumeSave(true);
+    }
     return;
   }
 
+  // Évite d’écrire si ça ne bouge pas vraiment (scrubs micro / jitter)
+  const prev = resumePositions[key] || 0;
+  if (Math.abs(prev - t) < 2) return;
+
   resumePositions[key] = t;
-  localStorage.setItem('tronAresResume', JSON.stringify(resumePositions));
+  _scheduleResumeSave(false);
 });
+
+// Flush quand on met pause / change d’onglet / quitte la page
+videoEl?.addEventListener('pause', () => _scheduleResumeSave(true));
+videoEl?.addEventListener('ended', () => _scheduleResumeSave(true));
+window.addEventListener('pagehide', () => _scheduleResumeSave(true));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') _scheduleResumeSave(true);
+});
+
 
 // Track menus
 audioTrackBtn?.addEventListener('click', (ev) => {
@@ -3805,10 +3186,18 @@ document.addEventListener('click', () => closeAllTrackMenus());
 // CHARGEMENT AUTOMATIQUE DES PLAYLISTS PRINCIPALES
 // =====================================================
 (async function loadMainPlaylists() {
-  await loadFromUrl("https://vsalema.github.io/tvpt4/css/getFeed_grouped_tmdb_categories_v3.m3u");
-  await loadFrM3u("https://vsalema.github.io/tvpt4/css/playlist-tvf-r.m3u");
+  await Promise.all([
+    loadFromUrl("https://vsalema.github.io/tvpt4/css/getFeed_grouped_tmdb_categories_v3.m3u", { deferRender: true }),
+    loadFrM3u("https://vsalema.github.io/tvpt4/css/playlist-tvf-r.m3u", { deferRender: true })
+  ]);
+  renderLists();
 
-  // ✅ Akamai-style: lecture directe via ?streamUrl=...
+  // Comportement identique à avant : si rien n’est en lecture, démarre au 1er item
+  if (channels.length && currentIndex === -1) {
+    playChannel(0);
+  }
+
+// ✅ Akamai-style: lecture directe via ?streamUrl=...
   const qs = getQueryParams();
   const directUrl = normalizeStreamUrl(qs.get('streamUrl'));
   if (directUrl) {
@@ -3849,3 +3238,7 @@ document.addEventListener('click', () => closeAllTrackMenus());
     playFrChannel(0);
   }
 })();
+
+
+// Init 🆕 Derniers ajouts
+fetchNewAdditionsIds().then(updateNewAdditionsButtonVisibility);

@@ -454,14 +454,6 @@ body {
   align-items: center;
 }
 
-/* Loader: lignes de boutons qui peuvent passer sur 2 lignes (évite les débordements mobile) */
-.loader-row--wrap{ flex-wrap: wrap; justify-content: center; }
-.loader-row--wrap .btn{ flex: 1 1 190px; min-width: 160px; }
-@media (max-width: 420px){
-  .loader-row--wrap .btn{ flex: 1 1 100%; }
-}
-
-
 .loader-subrow {
   font-size: 10px;
   color: var(--tron-muted);
@@ -1059,7 +1051,7 @@ video { object-fit: fill; }
 
 .clear-search-btn {
   position: absolute;
-  right: 10px;
+  right: 3px;
   top: 50%;
   transform: translateY(-50%);
   width: 18px;
@@ -2045,60 +2037,28 @@ html{ scrollbar-gutter: stable; }
 }
 
 
-/* 🆕 Derniers ajouts — badges & états */
-.new-badge{
-  display:inline-flex;
-  align-items:center;
+/* ============================
+   🆕 Derniers ajouts
+   ============================ */
+#newAdditionsContainer{
+  display:flex;
   justify-content:center;
-  margin-left:8px;
-  padding:2px 8px;
+  margin:10px 0;
+}
+#newAdditionsContainer.hidden{ display:none; }
+
+#newAdditionsBtn{
+  font-size:11px;
+  padding:8px 14px;
+  border:1px solid var(--tron-accent);
+  background: radial-gradient(circle at top, rgba(255,145,0,0.35), rgba(0,0,0,0.9));
   border-radius:999px;
-  font-size:10px;
-  letter-spacing:.06em;
-  border:1px solid rgba(255,255,255,.18);
-  background:rgba(255,255,255,.08);
+  box-shadow: var(--shadow-neon-amber);
+  color: var(--tron-text);
+  cursor:pointer;
+  transition: var(--transition-fast);
+}
+#newAdditionsBtn:hover{
   transform: translateY(-1px);
-}
-
-#toggleNewBtn.has-pending{
-  position:relative;
-}
-
-#toggleNewBtn.has-pending::after{
-  content:'';
-  position:absolute;
-  top:6px;
-  right:8px;
-  width:8px;
-  height:8px;
-  border-radius:50%;
-  background:rgba(255,255,255,.75);
-  box-shadow:0 0 0 2px rgba(0,0,0,.25);
-}
-
-#toggleNewBtn.is-active{
-  border-color: rgba(255,255,255,.35);
-  background: rgba(255,255,255,.10);
-}
-
-
-/* =========================
-   🆕 Derniers ajouts (Film M3U)
-   Centré sous miniRadioPlayer
-   ========================= */
-
-.new-additions-row {
-  display: flex;
-  width: 100%;
-}
-
-.new-additions-row--center {
-  justify-content: center;
-  margin-top: 10px;
-  margin-bottom: 6px;
-}
-
-/* Espace latéral cohérent avec la sidebar */
-#filmToolsRow {
-  padding: 0 10px;
+  box-shadow: 0 0 14px rgba(255,145,0,0.9);
 }
